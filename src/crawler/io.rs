@@ -51,9 +51,7 @@ impl Connection {
             reader,
             writer,
         )
-        .map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("bip324 handshake: {e}"))
-        })?;
+        .map_err(|e| std::io::Error::other(format!("bip324 handshake: {e}")))?;
         let handshake = Handshake::new();
         Self::write_message(&mut protocol, NetworkMessage::Version(self.us.clone()))?;
         Self::write_message(&mut protocol, NetworkMessage::SendAddrV2)?;
@@ -87,21 +85,21 @@ impl Connection {
         message: NetworkMessage,
     ) -> Result<(), std::io::Error> {
         let contents = bip324::serde::serialize(message);
-        protocol.write(&Payload::genuine(contents)).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("write_message: {e}"))
-        })?;
+        protocol
+            .write(&Payload::genuine(contents))
+            .map_err(|e| std::io::Error::other(format!("write_message: {e}")))?;
         Ok(())
     }
 
     fn read_message(
         protocol: &mut Protocol<BufReader<TcpStream>, BufWriter<TcpStream>>,
     ) -> Result<NetworkMessage, std::io::Error> {
-        let message = protocol.read().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("read_message: {e}"))
-        })?;
+        let message = protocol
+            .read()
+            .map_err(|e| std::io::Error::other(format!("read_message: {e}")))?;
         match message.packet_type() {
             PacketType::Genuine => Ok(bip324::serde::deserialize(message.contents())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?),
+                .map_err(|e| std::io::Error::other(e.to_string()))?),
             PacketType::Decoy => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Unexpected decoy packet.",

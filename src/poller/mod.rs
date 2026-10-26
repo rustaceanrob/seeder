@@ -30,7 +30,7 @@ pub fn continually_update_runs(addresses: &AddressSet) {
             Some(socket_addr) => match download_filter_range(&rt, socket_addr) {
                 Ok(stats) => {
                     tracing::info!(
-                        "Successful run with {socket_addr}. Took {} seconds",
+                        "Successful run with {socket_addr}. Took {}s.",
                         stats.time_elapsed.as_secs()
                     );
                     addresses.successful_run(socket_addr, stats);
@@ -40,8 +40,13 @@ pub fn continually_update_runs(addresses: &AddressSet) {
                     addresses.failed_run(socket_addr);
                 }
             },
-            None => std::thread::sleep(Duration::from_secs(5)),
+            None => {
+                tracing::info!("No addresses available for filter downloads. Waiting 60s.");
+                std::thread::sleep(Duration::from_secs(60));
+                continue;
+            }
         }
+        std::thread::sleep(Duration::from_secs(60 * 10));
     }
 }
 
@@ -94,12 +99,7 @@ async fn build_and_download(
                     break;
                 }
             }
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Unexpected end of sync",
-                ))
-            }
+            None => return Err(std::io::Error::other("Unexpected end of sync")),
             _ => (),
         }
     }

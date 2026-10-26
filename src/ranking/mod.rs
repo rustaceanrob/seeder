@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
@@ -14,6 +14,7 @@ use crate::poller::RunStats;
 
 const FAILED_COOLDOWN: Duration = Duration::from_secs(60 * 60 * 24);
 const FAILED_WEIGHT: f64 = 0.001;
+const RERUN_COOLDOWN: Duration = Duration::from_secs(60 * 60 * 24);
 const RERUN_WEIGHT: f64 = 0.001;
 const DNS_SAMPLE_SIZE: usize = 10;
 
@@ -87,12 +88,16 @@ impl AddressSet {
     pub fn sample_for_run(&self) -> Option<SocketAddr> {
         self.sample_by_weight(|status, now| match status {
             PeerStatus::ShouldMeasure(then) => Some(age_secs(now, *then)),
-            PeerStatus::SuccessfulRun(_) => Some(RERUN_WEIGHT),
+            PeerStatus::SuccessfulRun(stats)
+                if now.duration_since(stats.when).unwrap_or_default() > RERUN_COOLDOWN =>
+            {
+                Some(RERUN_WEIGHT)
+            }
             _ => None,
         })
     }
 
-    pub fn sample_successful(&self) -> Vec<SocketAddr> {
+    pub fn sample_successful(&self) -> Vec<IpAddr> {
         let lock = self.addrs.lock().unwrap();
         let mut rng = rand::rng();
         let mut keyed: Vec<(f64, SocketAddr)> = lock
@@ -108,7 +113,7 @@ impl AddressSet {
             .collect();
         keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         keyed.truncate(DNS_SAMPLE_SIZE);
-        keyed.into_iter().map(|(_, addr)| addr).collect()
+        keyed.into_iter().map(|(_, addr)| addr.ip()).collect()
     }
 
     fn sample_by_weight(
@@ -129,4 +134,27 @@ impl AddressSet {
 
 fn age_secs(now: SystemTime, then: SystemTime) -> f64 {
     now.duration_since(then).unwrap_or_default().as_secs() as f64 + 1.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_at(when: SystemTime) -> RunStats {
+        RunStats {
+            time_elapsed: Duration::from_secs(1),
+            when,
+        }
+    }
+
+    #[test]
+    fn sample_for_run_skips_recent_runs() {
+        let set = AddressSet::default();
+        let addr: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+        set.successful_run(addr, run_at(SystemTime::now()));
+        assert_eq!(set.sample_for_run(), None);
+        let stale = SystemTime::now() - RERUN_COOLDOWN - Duration::from_secs(1);
+        set.successful_run(addr, run_at(stale));
+        assert_eq!(set.sample_for_run(), Some(addr));
+    }
 }
