@@ -33,6 +33,7 @@ fn main() {
     let (_, addrs) = connection
         .open(socket_addr, Timeouts::default())
         .expect("Seed connection failed!");
+    tracing::info!("Seeded with {} network addresses", addrs.len());
     let set = AddressSet::default();
     set.add_gossiped(addrs);
     for id in 0..7 {

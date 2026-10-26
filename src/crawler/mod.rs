@@ -70,6 +70,9 @@ pub fn continuously_handshake(id: usize, addresses: &AddressSet) {
                         addresses.failed_handshake(addr);
                     }
                 }
+                let wait = rand::random_range(5..=60);
+                tracing::debug!("[thread {id}]: Sleeping for {wait}s.");
+                std::thread::sleep(Duration::from_secs(wait));
             }
             None => {
                 tracing::warn!(

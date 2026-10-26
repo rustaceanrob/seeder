@@ -49,12 +49,11 @@ pub fn download_filter_range(
     rt: &tokio::runtime::Runtime,
     addr: SocketAddr,
 ) -> Result<RunStats, std::io::Error> {
-    let from = HashCheckpoint::new(START_HEIGHT, STOP_HASH.parse::<BlockHash>().unwrap());
+    let from = HashCheckpoint::new(START_HEIGHT, START_HASH.parse::<BlockHash>().unwrap());
     let to = STOP_HASH.parse::<BlockHash>().unwrap();
-    let result = rt.block_on(tokio::time::timeout(
-        MAX_SYNC_TIME,
-        build_and_download(addr, from, to),
-    ));
+    let result = rt.block_on(async {
+        tokio::time::timeout(MAX_SYNC_TIME, build_and_download(addr, from, to)).await
+    });
     if let Ok(Ok(stats)) = result {
         return Ok(stats);
     }
@@ -72,6 +71,7 @@ async fn build_and_download(
     let (node, client) = Builder::new(Network::Bitcoin)
         .add_peer(addr)
         .chain_state(bip157::ChainState::Checkpoint(from))
+        .required_peers(1)
         .whitelist_only()
         .build();
     let Client {
@@ -81,9 +81,12 @@ async fn build_and_download(
         mut event_rx,
     } = client;
 
-    tokio::task::spawn(async move { trace_logs(info_rx, warn_rx).await });
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move { trace_logs(info_rx, warn_rx).await });
     let then = Instant::now();
-    tokio::task::spawn(async move { node.run().await });
+    tasks.spawn(async move {
+        let _ = node.run().await;
+    });
     loop {
         match event_rx.recv().await {
             Some(Event::IndexedFilter(filter)) => {
@@ -101,6 +104,7 @@ async fn build_and_download(
         }
     }
     let _ = requester.average_fee_rate(to).await;
+    let _ = requester.shutdown();
     Ok(RunStats {
         time_elapsed: then.elapsed(),
         when: SystemTime::now(),

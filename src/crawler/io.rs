@@ -25,9 +25,9 @@ pub struct Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         Self {
-            tcp: Duration::from_secs(5),
-            read: Duration::from_secs(5),
-            write: Duration::from_secs(5),
+            tcp: Duration::from_secs(10),
+            read: Duration::from_secs(10),
+            write: Duration::from_secs(10),
         }
     }
 }
