@@ -523,4 +523,216 @@ mod tests {
         let mut reader = Cursor::new([4u8, b's', b'e'].as_slice());
         assert!(decode_name(&mut reader).is_err());
     }
+
+    fn answers(response: &[u8], query_len: usize) -> (Cursor<&[u8]>, u16) {
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        let mut reader = Cursor::new(response);
+        reader
+            .seek(std::io::SeekFrom::Start(query_len as u64))
+            .unwrap();
+        (reader, ancount)
+    }
+
+    fn read_record(reader: &mut Cursor<&[u8]>) -> (String, u16, u16, u32, Vec<u8>) {
+        let name = decode_name(reader).unwrap();
+        let rtype = read_u16_be(reader).unwrap();
+        let class = read_u16_be(reader).unwrap();
+        let ttl = (read_u16_be(reader).unwrap() as u32) << 16 | read_u16_be(reader).unwrap() as u32;
+        let len = read_u16_be(reader).unwrap() as usize;
+        let start = reader.position() as usize;
+        let rdata = reader.get_ref()[start..start + len].to_vec();
+        reader.set_position((start + len) as u64);
+        (name, rtype, class, ttl, rdata)
+    }
+
+    fn sample() -> Vec<IpAddr> {
+        vec![
+            "2001:db8::1".parse().unwrap(),
+            "1.2.3.4".parse().unwrap(),
+            "2001:db8::2".parse().unwrap(),
+            "5.6.7.8".parse().unwrap(),
+            "9.9.9.9".parse().unwrap(),
+        ]
+    }
+
+    #[test]
+    fn rejects_malformed_headers() {
+        assert!(build_reponse(&[0u8; 11], test_config(), &[]).is_err());
+        let mut no_questions = query(0x01, "seed.example.com", QType::A);
+        no_questions[5] = 0;
+        assert!(build_reponse(&no_questions, test_config(), &[]).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_question() {
+        let query = query(0x01, "seed.example.com", QType::A);
+        for len in 12..query.len() {
+            assert!(
+                build_reponse(&query[..len], test_config(), &[]).is_err(),
+                "{len}"
+            );
+        }
+    }
+
+    #[test]
+    fn drops_non_internet_class() {
+        let mut query = query(0x01, "seed.example.com", QType::A);
+        let len = query.len();
+        query[len - 1] = 3;
+        assert!(build_reponse(&query, test_config(), &[]).is_err());
+    }
+
+    #[test]
+    fn echoes_id_question_and_recursion_bit() {
+        for (flags_high, expected) in [(0x00, 0x84), (0x01, 0x85)] {
+            let query = query(flags_high, "seed.example.com", QType::A);
+            let response = build_reponse(&query, test_config(), &[]).unwrap();
+            assert_eq!(&response[..2], &[0xAB, 0xCD]);
+            assert_eq!(response[2], expected);
+            assert_eq!(response[3], 0x00);
+            assert_eq!(&response[4..6], &1u16.to_be_bytes());
+            assert_eq!(&response[12..query.len()], &query[12..]);
+        }
+    }
+
+    #[test]
+    fn matches_hostname_case_insensitively() {
+        let query = query(0x01, "SeEd.ExAmPlE.cOm", QType::A);
+        let response = build_reponse(&query, test_config(), &sample()).unwrap();
+        assert_eq!(rcode_and_aa(&response), (0, true));
+        assert_eq!(&response[6..8], &1u16.to_be_bytes());
+    }
+
+    #[test]
+    fn a_query_returns_only_ipv4_up_to_limit() {
+        let config = Configuration {
+            query_answers: 2,
+            ..test_config()
+        };
+        let query = query(0x01, "seed.example.com", QType::A);
+        let response = build_reponse(&query, config, &sample()).unwrap();
+        let (mut reader, ancount) = answers(&response, query.len());
+        assert_eq!(ancount, 2);
+        let mut ips = Vec::new();
+        for _ in 0..ancount {
+            let (name, rtype, class, ttl, rdata) = read_record(&mut reader);
+            assert_eq!(
+                (name.as_str(), rtype, class, ttl),
+                ("seed.example.com", 1, 1, 60)
+            );
+            ips.push(rdata);
+        }
+        assert_eq!(ips, vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]]);
+        assert_eq!(reader.position() as usize, response.len());
+    }
+
+    #[test]
+    fn aaaa_query_returns_only_ipv6() {
+        let config = Configuration {
+            query_answers: 5,
+            ..test_config()
+        };
+        let query = query(0x01, "seed.example.com", QType::AAAA);
+        let response = build_reponse(&query, config, &sample()).unwrap();
+        let (mut reader, ancount) = answers(&response, query.len());
+        assert_eq!(ancount, 2);
+        for expected in ["2001:db8::1", "2001:db8::2"] {
+            let (_, rtype, _, _, rdata) = read_record(&mut reader);
+            assert_eq!(rtype, QType::AAAA.0);
+            let ip: std::net::Ipv6Addr = expected.parse().unwrap();
+            assert_eq!(rdata, ip.octets());
+        }
+        assert_eq!(reader.position() as usize, response.len());
+    }
+
+    #[test]
+    fn address_query_without_peers_is_empty_noerror() {
+        for qtype in [QType::A, QType::AAAA] {
+            let query = query(0x01, "seed.example.com", qtype);
+            let response = build_reponse(&query, test_config(), &[]).unwrap();
+            assert_eq!(rcode_and_aa(&response), (0, true));
+            assert_eq!(&response[6..8], &0u16.to_be_bytes());
+            assert_eq!(response.len(), query.len());
+        }
+    }
+
+    #[test]
+    fn soa_query_returns_zone_authority() {
+        let query = query(0x01, "seed.example.com", QType::SOA);
+        let response = build_reponse(&query, test_config(), &[]).unwrap();
+        assert_eq!(rcode_and_aa(&response), (0, true));
+        let (mut reader, ancount) = answers(&response, query.len());
+        assert_eq!(ancount, 1);
+        let (name, rtype, class, ttl, rdata) = read_record(&mut reader);
+        assert_eq!(
+            (name.as_str(), rtype, class, ttl),
+            ("seed.example.com", 6, 1, 60)
+        );
+        assert_eq!(reader.position() as usize, response.len());
+        let mut rdata = Cursor::new(rdata.as_slice());
+        assert_eq!(decode_name(&mut rdata).unwrap(), "ns1.example.com");
+        assert_eq!(decode_name(&mut rdata).unwrap(), "admin.example.com");
+        let mut timers = Vec::new();
+        for _ in 0..5 {
+            let mut bytes = [0u8; 4];
+            std::io::Read::read_exact(&mut rdata, &mut bytes).unwrap();
+            timers.push(u32::from_be_bytes(bytes));
+        }
+        assert_eq!(timers, vec![1, 3600, 600, 86400, 60]);
+        assert_eq!(rdata.position() as usize, rdata.get_ref().len());
+    }
+
+    #[test]
+    fn ns_query_returns_nameserver() {
+        let query = query(0x01, "seed.example.com", QType::NS);
+        let response = build_reponse(&query, test_config(), &[]).unwrap();
+        let (mut reader, ancount) = answers(&response, query.len());
+        assert_eq!(ancount, 1);
+        let (_, rtype, _, _, rdata) = read_record(&mut reader);
+        assert_eq!(rtype, QType::NS.0);
+        assert_eq!(
+            decode_name(&mut Cursor::new(rdata.as_slice())).unwrap(),
+            "ns1.example.com"
+        );
+        assert_eq!(reader.position() as usize, response.len());
+    }
+
+    #[test]
+    fn ignores_additional_records() {
+        let mut query = query(0x01, "seed.example.com", QType::A);
+        let question_len = query.len();
+        query[11] = 1;
+        query.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]);
+        let response = build_reponse(&query, test_config(), &sample()).unwrap();
+        assert_eq!(&response[10..12], &0u16.to_be_bytes());
+        let (mut reader, ancount) = answers(&response, question_len);
+        assert_eq!(ancount, 1);
+        assert_eq!(read_record(&mut reader).4, vec![1, 2, 3, 4]);
+        assert_eq!(reader.position() as usize, response.len());
+    }
+
+    #[test]
+    fn nxdomain_and_refused_have_no_answers() {
+        for name in ["a.b.seed.example.com", "example.org"] {
+            let query = query(0x01, name, QType::A);
+            let response = build_reponse(&query, test_config(), &sample()).unwrap();
+            assert_eq!(&response[6..8], &0u16.to_be_bytes(), "{name}");
+            assert_eq!(&response[12..], &query[12..], "{name}");
+        }
+    }
+
+    #[test]
+    fn largest_response_fits_in_udp_payload() {
+        let v6: Vec<IpAddr> = (1..=10u16)
+            .map(|i| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i)))
+            .collect();
+        for qtype in [QType::AAAA, QType::SOA, QType::NS] {
+            let config = Configuration {
+                query_answers: 5,
+                ..test_config()
+            };
+            let query = query(0x01, "seed.example.com", qtype);
+            assert!(build_reponse(&query, config, &v6).unwrap().len() <= 512);
+        }
+    }
 }

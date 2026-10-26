@@ -107,3 +107,143 @@ impl Connection {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{net::TcpListener, thread::JoinHandle};
+
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+
+    type PeerProtocol = Protocol<BufReader<TcpStream>, BufWriter<TcpStream>>;
+
+    fn short_timeouts() -> Timeouts {
+        Timeouts {
+            tcp: Duration::from_secs(2),
+            read: Duration::from_secs(2),
+            write: Duration::from_secs(2),
+        }
+    }
+
+    fn send(protocol: &mut PeerProtocol, message: NetworkMessage) {
+        protocol
+            .write(&Payload::genuine(bip324::serde::serialize(message)))
+            .unwrap();
+    }
+
+    fn recv(protocol: &mut PeerProtocol) -> NetworkMessage {
+        let payload = protocol.read().unwrap();
+        bip324::serde::deserialize(payload.contents()).unwrap()
+    }
+
+    fn fake_peer<T: Send + 'static>(
+        script: impl FnOnce(&mut PeerProtocol) -> T + Send + 'static,
+    ) -> (SocketAddr, JoinHandle<T>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let reader = BufReader::new(stream.try_clone().unwrap());
+            let writer = BufWriter::new(stream);
+            let mut protocol = Protocol::new(
+                bip324::Network::Bitcoin,
+                Role::Responder,
+                None,
+                None,
+                reader,
+                writer,
+            )
+            .unwrap();
+            script(&mut protocol)
+        });
+        (addr, handle)
+    }
+
+    fn peer_version(services: ServiceFlags) -> NetworkMessage {
+        let mut version = Connection::config(0).us;
+        version.services = services;
+        NetworkMessage::Version(version)
+    }
+
+    fn gossip() -> Vec<AddrV2Message> {
+        vec![AddrV2Message {
+            time: 0,
+            services: ServiceFlags::NONE,
+            addr: AddrV2::Ipv4("1.2.3.4".parse().unwrap()),
+            port: 8333,
+        }]
+    }
+
+    #[test]
+    fn open_completes_handshake_and_collects_addresses() {
+        let services = ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS;
+        let (addr, peer) = fake_peer(move |protocol| {
+            let mut received = vec![recv(protocol), recv(protocol)];
+            send(protocol, peer_version(services));
+            send(protocol, NetworkMessage::SendAddrV2);
+            send(protocol, NetworkMessage::WtxidRelay);
+            send(protocol, NetworkMessage::Verack);
+            received.push(recv(protocol));
+            received.push(recv(protocol));
+            send(protocol, NetworkMessage::SendHeaders);
+            send(protocol, NetworkMessage::Ping(7));
+            received.push(recv(protocol));
+            send(protocol, NetworkMessage::AddrV2(gossip()));
+            received
+        });
+        let (flags, addrs) = Connection::config(0).open(addr, short_timeouts()).unwrap();
+        assert_eq!(flags, services);
+        assert_eq!(addrs, vec!["1.2.3.4:8333".parse::<SocketAddr>().unwrap()]);
+        let received = peer.join().unwrap();
+        assert!(matches!(received[0], NetworkMessage::Version(_)));
+        assert_eq!(received[1], NetworkMessage::SendAddrV2);
+        assert_eq!(received[2], NetworkMessage::Verack);
+        assert_eq!(received[3], NetworkMessage::GetAddr);
+        assert_eq!(received[4], NetworkMessage::Pong(7));
+    }
+
+    #[test]
+    fn open_rejects_decoy_packets() {
+        let (addr, peer) = fake_peer(|protocol| {
+            recv(protocol);
+            recv(protocol);
+            protocol.write(&Payload::decoy(vec![0u8; 8])).unwrap();
+        });
+        assert!(Connection::config(0).open(addr, short_timeouts()).is_err());
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn open_fails_when_peer_disconnects() {
+        let (addr, peer) = fake_peer(|protocol| {
+            recv(protocol);
+            recv(protocol);
+            send(protocol, peer_version(ServiceFlags::COMPACT_FILTERS));
+        });
+        assert!(Connection::config(0).open(addr, short_timeouts()).is_err());
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn open_fails_when_version_is_not_first() {
+        let (addr, peer) = fake_peer(|protocol| {
+            recv(protocol);
+            recv(protocol);
+            send(protocol, NetworkMessage::Verack);
+        });
+        assert!(Connection::config(0).open(addr, short_timeouts()).is_err());
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn open_fails_without_a_listener() {
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        assert!(Connection::config(0).open(addr, short_timeouts()).is_err());
+    }
+}

@@ -130,3 +130,145 @@ impl Handshake<VerackReceived> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+
+    fn version(services: ServiceFlags) -> NetworkMessage {
+        let mut version = crate::crawler::Connection::config(0).us;
+        version.services = services;
+        NetworkMessage::Version(version)
+    }
+
+    fn negotiated(services: ServiceFlags) -> Handshake<VerackReceived> {
+        let handshake = Handshake::new().process_message(version(services)).unwrap();
+        match handshake.process_message(NetworkMessage::Verack).unwrap() {
+            ProcessNegotiation::Completed(handshake) => handshake,
+            ProcessNegotiation::Continue(_) => panic!("verack must complete negotiation"),
+        }
+    }
+
+    fn addr_v2(addr: AddrV2, port: u16) -> AddrV2Message {
+        AddrV2Message {
+            time: 0,
+            services: ServiceFlags::NONE,
+            addr,
+            port,
+        }
+    }
+
+    #[test]
+    fn version_must_be_first() {
+        for message in [
+            NetworkMessage::Verack,
+            NetworkMessage::SendAddrV2,
+            NetworkMessage::Ping(1),
+        ] {
+            assert!(Handshake::new().process_message(message).is_err());
+        }
+    }
+
+    #[test]
+    fn negotiation_messages_continue_until_verack() {
+        let mut handshake = Handshake::new()
+            .process_message(version(ServiceFlags::NONE))
+            .unwrap();
+        for message in [
+            NetworkMessage::SendHeaders,
+            NetworkMessage::SendAddrV2,
+            NetworkMessage::WtxidRelay,
+            NetworkMessage::FeeFilter(1_000),
+        ] {
+            handshake = match handshake.process_message(message).unwrap() {
+                ProcessNegotiation::Continue(handshake) => handshake,
+                ProcessNegotiation::Completed(_) => panic!("only verack completes negotiation"),
+            };
+        }
+        assert!(matches!(
+            handshake.process_message(NetworkMessage::Verack).unwrap(),
+            ProcessNegotiation::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn unexpected_message_during_negotiation_fails() {
+        let handshake = Handshake::new()
+            .process_message(version(ServiceFlags::NONE))
+            .unwrap();
+        assert!(handshake.process_message(NetworkMessage::GetAddr).is_err());
+        let handshake = Handshake::new()
+            .process_message(version(ServiceFlags::NONE))
+            .unwrap();
+        assert!(handshake
+            .process_message(version(ServiceFlags::NONE))
+            .is_err());
+    }
+
+    #[test]
+    fn ping_after_verack_requests_pong() {
+        let handshake = negotiated(ServiceFlags::NONE);
+        match handshake.process_message(NetworkMessage::Ping(42)).unwrap() {
+            ProcessAddresses::SendPong(_, nonce) => assert_eq!(nonce, 42),
+            _ => panic!("ping must request a pong"),
+        }
+    }
+
+    #[test]
+    fn unrelated_messages_after_verack_continue() {
+        let mut handshake = negotiated(ServiceFlags::NONE);
+        for message in [
+            NetworkMessage::SendHeaders,
+            NetworkMessage::FeeFilter(1_000),
+            NetworkMessage::Addr(Vec::new()),
+            NetworkMessage::Pong(1),
+        ] {
+            handshake = match handshake.process_message(message).unwrap() {
+                ProcessAddresses::Continue(handshake) => handshake,
+                _ => panic!("message should be ignored"),
+            };
+        }
+    }
+
+    #[test]
+    fn protocol_violations_after_verack_fail() {
+        for message in [
+            version(ServiceFlags::NONE),
+            NetworkMessage::Verack,
+            NetworkMessage::MemPool,
+            NetworkMessage::FilterClear,
+        ] {
+            assert!(negotiated(ServiceFlags::NONE)
+                .process_message(message)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn addrv2_completes_with_peer_services_and_ip_addresses() {
+        let services = ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS;
+        let handshake = negotiated(services);
+        let entries = vec![
+            addr_v2(AddrV2::Ipv4("1.2.3.4".parse().unwrap()), 8333),
+            addr_v2(AddrV2::TorV3([7; 32]), 8333),
+            addr_v2(AddrV2::Ipv6("2001:db8::1".parse().unwrap()), 8334),
+        ];
+        match handshake
+            .process_message(NetworkMessage::AddrV2(entries))
+            .unwrap()
+        {
+            ProcessAddresses::Completed((flags, addrs)) => {
+                assert_eq!(flags, services);
+                assert_eq!(
+                    addrs,
+                    vec![
+                        "1.2.3.4:8333".parse::<SocketAddr>().unwrap(),
+                        "[2001:db8::1]:8334".parse().unwrap(),
+                    ]
+                );
+            }
+            _ => panic!("addrv2 must complete the handshake"),
+        }
+    }
+}
