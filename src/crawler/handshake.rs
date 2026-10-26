@@ -1,7 +1,7 @@
 use core::option::Option;
 use std::{marker::PhantomData, net::SocketAddr};
 
-use bip324::serde::NetworkMessage;
+use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::{message_network::VersionMessage, ServiceFlags};
 
 pub struct Unitialized;

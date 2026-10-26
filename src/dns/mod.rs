@@ -17,7 +17,7 @@ pub struct Configuration<'a> {
     // Time until cached response must be requested again
     pub ttl: u32,
     // Number of records to respond with
-    pub query_answers: usize,
+    pub query_answers: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -217,7 +217,7 @@ impl AnswerSection {
     ) -> AnswerSection {
         let mut data = Vec::new();
         let mut matched = 0u16;
-        for ip in ips.take(config.query_answers) {
+        for ip in ips.take(config.query_answers as usize) {
             match ip {
                 IpAddr::V4(ipv4) => {
                     write_record_header(&mut data, &qtype, config.ttl, 4);
@@ -254,7 +254,7 @@ impl AnswerSection {
 
 pub fn build_reponse(
     data: &[u8],
-    config: Configuration<'_>,
+    config: &Configuration<'_>,
     sample: &[IpAddr],
 ) -> std::io::Result<Vec<u8>> {
     if data.len() < 12 {
@@ -457,13 +457,13 @@ mod tests {
     #[test]
     fn drops_responses() {
         let query = query(0x81, "seed.example.com", QType::A);
-        assert!(build_reponse(&query, test_config(), &[]).is_err());
+        assert!(build_reponse(&query, &test_config(), &[]).is_err());
     }
 
     #[test]
     fn answers_nodata_for_unsupported_type() {
         let query = query(0x01, "seed.example.com", QType(65));
-        let response = build_reponse(&query, test_config(), &[]).unwrap();
+        let response = build_reponse(&query, &test_config(), &[]).unwrap();
         assert_eq!(rcode_and_aa(&response), (0, true));
         assert_eq!(&response[6..8], &0u16.to_be_bytes()); // ANCOUNT
     }
@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn answers_nxdomain_below_zone() {
         let query = query(0x01, "x.SEED.example.com", QType::A);
-        let response = build_reponse(&query, test_config(), &[]).unwrap();
+        let response = build_reponse(&query, &test_config(), &[]).unwrap();
         assert_eq!(rcode_and_aa(&response), (3, true));
     }
 
@@ -479,7 +479,7 @@ mod tests {
     fn refuses_outside_zone() {
         for name in ["example.com", "evilseed.example.com", "seed.example.org"] {
             let query = query(0x01, name, QType::A);
-            let response = build_reponse(&query, test_config(), &[]).unwrap();
+            let response = build_reponse(&query, &test_config(), &[]).unwrap();
             assert_eq!(rcode_and_aa(&response), (5, false), "{name}");
             assert_eq!(&response[2..3], &[0x81]); // QR | echoed RD
         }
@@ -502,7 +502,7 @@ mod tests {
             "1.2.3.4".parse().unwrap(),
             "5.6.7.8".parse().unwrap(),
         ];
-        let response = build_reponse(&query, config, &sample).unwrap();
+        let response = build_reponse(&query, &config, &sample).unwrap();
         assert_eq!(&response[..2], &[0xAB, 0xCD]);
         assert_eq!(&response[6..8], &1u16.to_be_bytes()); // ANCOUNT
         let mut reader = Cursor::new(response.as_slice());
@@ -557,10 +557,10 @@ mod tests {
 
     #[test]
     fn rejects_malformed_headers() {
-        assert!(build_reponse(&[0u8; 11], test_config(), &[]).is_err());
+        assert!(build_reponse(&[0u8; 11], &test_config(), &[]).is_err());
         let mut no_questions = query(0x01, "seed.example.com", QType::A);
         no_questions[5] = 0;
-        assert!(build_reponse(&no_questions, test_config(), &[]).is_err());
+        assert!(build_reponse(&no_questions, &test_config(), &[]).is_err());
     }
 
     #[test]
@@ -568,7 +568,7 @@ mod tests {
         let query = query(0x01, "seed.example.com", QType::A);
         for len in 12..query.len() {
             assert!(
-                build_reponse(&query[..len], test_config(), &[]).is_err(),
+                build_reponse(&query[..len], &test_config(), &[]).is_err(),
                 "{len}"
             );
         }
@@ -579,14 +579,14 @@ mod tests {
         let mut query = query(0x01, "seed.example.com", QType::A);
         let len = query.len();
         query[len - 1] = 3;
-        assert!(build_reponse(&query, test_config(), &[]).is_err());
+        assert!(build_reponse(&query, &test_config(), &[]).is_err());
     }
 
     #[test]
     fn echoes_id_question_and_recursion_bit() {
         for (flags_high, expected) in [(0x00, 0x84), (0x01, 0x85)] {
             let query = query(flags_high, "seed.example.com", QType::A);
-            let response = build_reponse(&query, test_config(), &[]).unwrap();
+            let response = build_reponse(&query, &test_config(), &[]).unwrap();
             assert_eq!(&response[..2], &[0xAB, 0xCD]);
             assert_eq!(response[2], expected);
             assert_eq!(response[3], 0x00);
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn matches_hostname_case_insensitively() {
         let query = query(0x01, "SeEd.ExAmPlE.cOm", QType::A);
-        let response = build_reponse(&query, test_config(), &sample()).unwrap();
+        let response = build_reponse(&query, &test_config(), &sample()).unwrap();
         assert_eq!(rcode_and_aa(&response), (0, true));
         assert_eq!(&response[6..8], &1u16.to_be_bytes());
     }
@@ -610,7 +610,7 @@ mod tests {
             ..test_config()
         };
         let query = query(0x01, "seed.example.com", QType::A);
-        let response = build_reponse(&query, config, &sample()).unwrap();
+        let response = build_reponse(&query, &config, &sample()).unwrap();
         let (mut reader, ancount) = answers(&response, query.len());
         assert_eq!(ancount, 2);
         let mut ips = Vec::new();
@@ -633,7 +633,7 @@ mod tests {
             ..test_config()
         };
         let query = query(0x01, "seed.example.com", QType::AAAA);
-        let response = build_reponse(&query, config, &sample()).unwrap();
+        let response = build_reponse(&query, &config, &sample()).unwrap();
         let (mut reader, ancount) = answers(&response, query.len());
         assert_eq!(ancount, 2);
         for expected in ["2001:db8::1", "2001:db8::2"] {
@@ -649,7 +649,7 @@ mod tests {
     fn address_query_without_peers_is_empty_noerror() {
         for qtype in [QType::A, QType::AAAA] {
             let query = query(0x01, "seed.example.com", qtype);
-            let response = build_reponse(&query, test_config(), &[]).unwrap();
+            let response = build_reponse(&query, &test_config(), &[]).unwrap();
             assert_eq!(rcode_and_aa(&response), (0, true));
             assert_eq!(&response[6..8], &0u16.to_be_bytes());
             assert_eq!(response.len(), query.len());
@@ -659,7 +659,7 @@ mod tests {
     #[test]
     fn soa_query_returns_zone_authority() {
         let query = query(0x01, "seed.example.com", QType::SOA);
-        let response = build_reponse(&query, test_config(), &[]).unwrap();
+        let response = build_reponse(&query, &test_config(), &[]).unwrap();
         assert_eq!(rcode_and_aa(&response), (0, true));
         let (mut reader, ancount) = answers(&response, query.len());
         assert_eq!(ancount, 1);
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn ns_query_returns_nameserver() {
         let query = query(0x01, "seed.example.com", QType::NS);
-        let response = build_reponse(&query, test_config(), &[]).unwrap();
+        let response = build_reponse(&query, &test_config(), &[]).unwrap();
         let (mut reader, ancount) = answers(&response, query.len());
         assert_eq!(ancount, 1);
         let (_, rtype, _, _, rdata) = read_record(&mut reader);
@@ -703,7 +703,7 @@ mod tests {
         let question_len = query.len();
         query[11] = 1;
         query.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]);
-        let response = build_reponse(&query, test_config(), &sample()).unwrap();
+        let response = build_reponse(&query, &test_config(), &sample()).unwrap();
         assert_eq!(&response[10..12], &0u16.to_be_bytes());
         let (mut reader, ancount) = answers(&response, question_len);
         assert_eq!(ancount, 1);
@@ -715,7 +715,7 @@ mod tests {
     fn nxdomain_and_refused_have_no_answers() {
         for name in ["a.b.seed.example.com", "example.org"] {
             let query = query(0x01, name, QType::A);
-            let response = build_reponse(&query, test_config(), &sample()).unwrap();
+            let response = build_reponse(&query, &test_config(), &sample()).unwrap();
             assert_eq!(&response[6..8], &0u16.to_be_bytes(), "{name}");
             assert_eq!(&response[12..], &query[12..], "{name}");
         }
@@ -732,7 +732,7 @@ mod tests {
                 ..test_config()
             };
             let query = query(0x01, "seed.example.com", qtype);
-            assert!(build_reponse(&query, config, &v6).unwrap().len() <= 512);
+            assert!(build_reponse(&query, &config, &v6).unwrap().len() <= 512);
         }
     }
 }

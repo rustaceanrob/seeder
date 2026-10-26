@@ -1,0 +1,44 @@
+[[param]]
+name = "port"
+type = "u16"
+optional = true
+default = "53"
+doc = "Port to listen on."
+
+[[param]]
+name = "hostname"
+type = "String"
+optional = false
+doc = "Hostname the nameserver is the authority for."
+
+[[param]]
+name = "nameserver"
+type = "String"
+optional = false
+doc = "Nameserver e.g. ns1.example.com"
+
+[[param]]
+name = "hostmaster"
+type = "String"
+optional = false
+doc = "Email e.g. admin.example.com"
+
+[[param]]
+name = "ttl"
+type = "u32"
+optional = true
+default = "60"
+doc = "TTL for records."
+
+[[param]]
+name = "answers"
+type = "u16"
+optional = true
+default = "10"
+doc = "Maximum number of responses."
+
+[[param]]
+name = "seed_node"
+type = "std::net::SocketAddr"
+optional = false
+doc = "Peer to bootstrap the crawler from e.g. 1.2.3.4:8333"

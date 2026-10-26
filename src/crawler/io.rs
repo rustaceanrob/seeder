@@ -1,15 +1,16 @@
 use std::{
-    io::{BufReader, BufWriter},
+    io::{BufReader, BufWriter, Write},
     net::{SocketAddr, TcpStream},
     time::Duration,
 };
 
-use bip324::{
-    io::{Payload, Protocol},
-    serde::NetworkMessage,
-    PacketType, Role,
+use bitcoin::{
+    consensus::{encode, Decodable},
+    p2p::{
+        message::{NetworkMessage, RawNetworkMessage},
+        Magic, ServiceFlags,
+    },
 };
-use bitcoin::p2p::ServiceFlags;
 
 use crate::crawler::{
     handshake::{Handshake, ProcessAddresses, ProcessNegotiation},
@@ -32,6 +33,11 @@ impl Default for Timeouts {
     }
 }
 
+pub struct Protocol {
+    reader: BufReader<TcpStream>,
+    writer: BufWriter<TcpStream>,
+}
+
 impl Connection {
     pub fn open(
         &self,
@@ -41,17 +47,10 @@ impl Connection {
         let tcp_stream = TcpStream::connect_timeout(&socket_addr, timeouts.tcp)?;
         tcp_stream.set_write_timeout(Some(timeouts.write))?;
         tcp_stream.set_read_timeout(Some(timeouts.read))?;
-        let reader = BufReader::new(tcp_stream.try_clone()?);
-        let writer = BufWriter::new(tcp_stream);
-        let mut protocol = Protocol::new(
-            bip324::Network::Bitcoin,
-            Role::Initiator,
-            None,
-            None,
-            reader,
-            writer,
-        )
-        .map_err(|e| std::io::Error::other(format!("bip324 handshake: {e}")))?;
+        let mut protocol = Protocol {
+            reader: BufReader::new(tcp_stream.try_clone()?),
+            writer: BufWriter::new(tcp_stream),
+        };
         let handshake = Handshake::new();
         Self::write_message(&mut protocol, NetworkMessage::Version(self.us.clone()))?;
         Self::write_message(&mut protocol, NetworkMessage::SendAddrV2)?;
@@ -81,30 +80,25 @@ impl Connection {
     }
 
     fn write_message(
-        protocol: &mut Protocol<BufReader<TcpStream>, BufWriter<TcpStream>>,
+        protocol: &mut Protocol,
         message: NetworkMessage,
     ) -> Result<(), std::io::Error> {
-        let contents = bip324::serde::serialize(message);
-        protocol
-            .write(&Payload::genuine(contents))
-            .map_err(|e| std::io::Error::other(format!("write_message: {e}")))?;
-        Ok(())
+        let raw = RawNetworkMessage::new(Magic::BITCOIN, message);
+        protocol.writer.write_all(&encode::serialize(&raw))?;
+        protocol.writer.flush()
     }
 
-    fn read_message(
-        protocol: &mut Protocol<BufReader<TcpStream>, BufWriter<TcpStream>>,
-    ) -> Result<NetworkMessage, std::io::Error> {
-        let message = protocol
-            .read()
-            .map_err(|e| std::io::Error::other(format!("read_message: {e}")))?;
-        match message.packet_type() {
-            PacketType::Genuine => Ok(bip324::serde::deserialize(message.contents())
-                .map_err(|e| std::io::Error::other(e.to_string()))?),
-            PacketType::Decoy => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Unexpected decoy packet.",
-            )),
+    fn read_message(protocol: &mut Protocol) -> Result<NetworkMessage, std::io::Error> {
+        let raw =
+            RawNetworkMessage::consensus_decode(bitcoin::io::from_std_mut(&mut protocol.reader))
+                .map_err(|e| std::io::Error::other(format!("read_message: {e}")))?;
+        if *raw.magic() != Magic::BITCOIN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "read_message: wrong network magic",
+            ));
         }
+        Ok(raw.into_payload())
     }
 }
 
@@ -115,8 +109,6 @@ mod tests {
 
     use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 
-    type PeerProtocol = Protocol<BufReader<TcpStream>, BufWriter<TcpStream>>;
-
     fn short_timeouts() -> Timeouts {
         Timeouts {
             tcp: Duration::from_secs(2),
@@ -125,19 +117,16 @@ mod tests {
         }
     }
 
-    fn send(protocol: &mut PeerProtocol, message: NetworkMessage) {
-        protocol
-            .write(&Payload::genuine(bip324::serde::serialize(message)))
-            .unwrap();
+    fn send(protocol: &mut Protocol, message: NetworkMessage) {
+        Connection::write_message(protocol, message).unwrap();
     }
 
-    fn recv(protocol: &mut PeerProtocol) -> NetworkMessage {
-        let payload = protocol.read().unwrap();
-        bip324::serde::deserialize(payload.contents()).unwrap()
+    fn recv(protocol: &mut Protocol) -> NetworkMessage {
+        Connection::read_message(protocol).unwrap()
     }
 
     fn fake_peer<T: Send + 'static>(
-        script: impl FnOnce(&mut PeerProtocol) -> T + Send + 'static,
+        script: impl FnOnce(&mut Protocol) -> T + Send + 'static,
     ) -> (SocketAddr, JoinHandle<T>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -146,17 +135,10 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            let reader = BufReader::new(stream.try_clone().unwrap());
-            let writer = BufWriter::new(stream);
-            let mut protocol = Protocol::new(
-                bip324::Network::Bitcoin,
-                Role::Responder,
-                None,
-                None,
-                reader,
-                writer,
-            )
-            .unwrap();
+            let mut protocol = Protocol {
+                reader: BufReader::new(stream.try_clone().unwrap()),
+                writer: BufWriter::new(stream),
+            };
             script(&mut protocol)
         });
         (addr, handle)
@@ -203,17 +185,6 @@ mod tests {
         assert_eq!(received[2], NetworkMessage::Verack);
         assert_eq!(received[3], NetworkMessage::GetAddr);
         assert_eq!(received[4], NetworkMessage::Pong(7));
-    }
-
-    #[test]
-    fn open_rejects_decoy_packets() {
-        let (addr, peer) = fake_peer(|protocol| {
-            recv(protocol);
-            recv(protocol);
-            protocol.write(&Payload::decoy(vec![0u8; 8])).unwrap();
-        });
-        assert!(Connection::config(0).open(addr, short_timeouts()).is_err());
-        peer.join().unwrap();
     }
 
     #[test]

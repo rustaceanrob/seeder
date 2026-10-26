@@ -113,8 +113,14 @@ impl AddressSet {
             })
             .collect();
         keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        keyed.truncate(DNS_SAMPLE_SIZE);
-        keyed.into_iter().map(|(_, addr)| addr.ip()).collect()
+        let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) = keyed
+            .into_iter()
+            .map(|(_, addr)| addr.ip())
+            .partition(IpAddr::is_ipv4);
+        v4.into_iter()
+            .take(DNS_SAMPLE_SIZE)
+            .chain(v6.into_iter().take(DNS_SAMPLE_SIZE))
+            .collect()
     }
 
     fn sample_by_weight(
@@ -290,6 +296,24 @@ mod tests {
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), DNS_SAMPLE_SIZE);
+    }
+
+    #[test]
+    fn dns_sample_is_capped_per_address_family() {
+        let set = AddressSet::default();
+        for i in 0..(DNS_SAMPLE_SIZE as u8 * 2) {
+            set.successful_run(addr(&format!("1.2.3.{i}:8333")), run_at(SystemTime::now()));
+        }
+        set.successful_run(addr("[2001:db8::1]:8333"), run_at(SystemTime::now()));
+        set.successful_run(addr("[2001:db8::2]:8333"), run_at(SystemTime::now()));
+        for _ in 0..20 {
+            let sample = set.sample_successful();
+            assert_eq!(
+                sample.iter().filter(|ip| ip.is_ipv4()).count(),
+                DNS_SAMPLE_SIZE
+            );
+            assert_eq!(sample.iter().filter(|ip| ip.is_ipv6()).count(), 2);
+        }
     }
 
     #[test]

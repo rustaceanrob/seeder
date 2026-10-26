@@ -4,7 +4,7 @@ use std::{
 };
 
 use bip157::{tokio, BlockHash, Builder, Client, Event, HashCheckpoint, Info, Receiver, Warning};
-use bip324::Network;
+use bitcoin::Network;
 
 use crate::ranking::AddressSet;
 
