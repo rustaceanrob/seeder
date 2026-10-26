@@ -2,6 +2,7 @@
 name = "seeder"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [package.metadata.configure_me]
 spec = "config_spec.toml"
