@@ -21,6 +21,7 @@ pub struct RunStats {
 
 pub fn continually_update_runs(addresses: &AddressSet) {
     let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
         .expect("tokio runtime required");
     loop {
