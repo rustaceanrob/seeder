@@ -5,7 +5,10 @@ use std::{
 
 use bitcoin::p2p::{message_network::VersionMessage, Address, ServiceFlags};
 
-use crate::{crawler::io::Timeouts, ranking::AddressSet};
+use crate::{
+    crawler::{handshake::is_rejected, io::Timeouts},
+    ranking::AddressSet,
+};
 
 pub mod handshake;
 pub mod io;
@@ -64,6 +67,10 @@ pub fn continuously_handshake(id: usize, addresses: &AddressSet) {
                             tracing::warn!("[thread {id}]: {addr} does not serve compact filters.",);
                             addresses.unsupported(addr);
                         }
+                    }
+                    Err(e) if is_rejected(&e) => {
+                        tracing::warn!("[thread {id}]: {addr}: {e}");
+                        addresses.rejected(addr);
                     }
                     Err(e) => {
                         tracing::error!("[thread {id}]: {e}");

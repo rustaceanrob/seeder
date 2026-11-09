@@ -1,10 +1,29 @@
 use core::option::Option;
-use std::{marker::PhantomData, net::SocketAddr};
+use std::{fmt::Display, marker::PhantomData, net::SocketAddr};
 
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::{message_network::VersionMessage, ServiceFlags};
 
-pub struct Unitialized;
+const REJECTED_USER_AGENTS: [&str; 2] = ["Knots", "UASF"];
+
+#[derive(Debug)]
+pub struct RejectedUserAgent(String);
+
+impl Display for RejectedUserAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Rejected user agent {}", self.0)
+    }
+}
+
+impl std::error::Error for RejectedUserAgent {}
+
+pub fn is_rejected(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<RejectedUserAgent>())
+}
+
+pub struct Uninitialized;
 
 pub struct VersionReceived;
 
@@ -14,13 +33,13 @@ mod sealed {
     pub trait Sealed {}
 }
 
-impl sealed::Sealed for Unitialized {}
+impl sealed::Sealed for Uninitialized {}
 impl sealed::Sealed for VersionReceived {}
 impl sealed::Sealed for VerackReceived {}
 
 pub trait State: sealed::Sealed {}
 
-impl State for Unitialized {}
+impl State for Uninitialized {}
 impl State for VersionReceived {}
 impl State for VerackReceived {}
 
@@ -41,8 +60,8 @@ pub struct Handshake<S: State> {
     _marker: PhantomData<S>,
 }
 
-impl Handshake<Unitialized> {
-    pub fn new() -> Handshake<Unitialized> {
+impl Handshake<Uninitialized> {
+    pub fn new() -> Handshake<Uninitialized> {
         Self {
             version: None,
             addrs: Vec::with_capacity(1_000),
@@ -55,6 +74,12 @@ impl Handshake<Unitialized> {
         message: NetworkMessage,
     ) -> Result<Handshake<VersionReceived>, std::io::Error> {
         if let NetworkMessage::Version(version) = message {
+            if REJECTED_USER_AGENTS
+                .iter()
+                .any(|rejected| version.user_agent.contains(rejected))
+            {
+                return Err(std::io::Error::other(RejectedUserAgent(version.user_agent)));
+            }
             return Ok(Handshake {
                 version: Some(version),
                 addrs: self.addrs,
@@ -168,6 +193,33 @@ mod tests {
         ] {
             assert!(Handshake::new().process_message(message).is_err());
         }
+    }
+
+    #[test]
+    fn knots_and_uasf_user_agents_are_rejected() {
+        for user_agent in [
+            "/Satoshi:29.5.0/Knots:20260508/",
+            "/Satoshi:29.2.0/Knots:20251110/",
+            "/Satoshi:29.3.0/Knots:20260210+bip110-v0.3/UASF-BIP110:0.1/",
+            "/Satoshi:29.3.0/UASF-BIP110:0.1/",
+        ] {
+            let mut version = crate::crawler::Connection::config(0).us;
+            version.user_agent = user_agent.to_string();
+            let error = Handshake::new()
+                .process_message(NetworkMessage::Version(version))
+                .err()
+                .unwrap();
+            assert!(is_rejected(&error));
+        }
+    }
+
+    #[test]
+    fn other_handshake_errors_are_not_rejections() {
+        let error = Handshake::new()
+            .process_message(NetworkMessage::Verack)
+            .err()
+            .unwrap();
+        assert!(!is_rejected(&error));
     }
 
     #[test]

@@ -298,7 +298,7 @@ pub fn build_reponse(
         let rsp = ResponseCode::NO_ERROR;
         let flags = Flags::new(recurse_bit, rsp);
         return Ok(
-            AnswerSection::a_or_aaaa_response(id, flags, &config, ip_iter, QType::A)
+            AnswerSection::a_or_aaaa_response(id, flags, config, ip_iter, QType::A)
                 .finish(question),
         );
     }
@@ -307,19 +307,19 @@ pub fn build_reponse(
         let rsp = ResponseCode::NO_ERROR;
         let flags = Flags::new(recurse_bit, rsp);
         return Ok(
-            AnswerSection::a_or_aaaa_response(id, flags, &config, ip_iter, QType::AAAA)
+            AnswerSection::a_or_aaaa_response(id, flags, config, ip_iter, QType::AAAA)
                 .finish(question),
         );
     }
     if qtype == QType::SOA {
         let rsp = ResponseCode::NO_ERROR;
         let flags = Flags::new(recurse_bit, rsp);
-        return Ok(AnswerSection::soa_response(id, flags, &config).finish(question));
+        return Ok(AnswerSection::soa_response(id, flags, config).finish(question));
     }
     if qtype == QType::NS {
         let rsp = ResponseCode::NO_ERROR;
         let flags = Flags::new(recurse_bit, rsp);
-        return Ok(AnswerSection::ns_response(id, flags, &config).finish(question));
+        return Ok(AnswerSection::ns_response(id, flags, config).finish(question));
     }
     // The name exists but has no records of this type (NODATA).
     let rsp = ResponseCode::NO_ERROR;

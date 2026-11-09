@@ -10,7 +10,7 @@ use crate::ranking::AddressSet;
 
 pub const START_HASH: &str = "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054";
 pub const START_HEIGHT: u32 = 800_000;
-pub const STOP_HASH: &str = "000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a";
+pub const STOP_HASH: &str = "00000000000000000001be5a79adba906d80e75f34b8fe8b42983ba127faefd0";
 pub const MAX_SYNC_TIME: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Copy)]

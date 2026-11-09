@@ -25,6 +25,7 @@ pub enum PeerStatus {
     ShouldMeasure(SystemTime),
     Gossiped(SystemTime),
     NoFilters,
+    Rejected,
     Failed((SystemTime, u8)),
 }
 
@@ -59,6 +60,11 @@ impl AddressSet {
     pub fn unsupported(&self, addr: SocketAddr) {
         let mut lock = self.addrs.lock().unwrap();
         lock.insert(addr, PeerStatus::NoFilters);
+    }
+
+    pub fn rejected(&self, addr: SocketAddr) {
+        let mut lock = self.addrs.lock().unwrap();
+        lock.insert(addr, PeerStatus::Rejected);
     }
 
     pub fn failed_handshake(&self, addr: SocketAddr) {
@@ -221,6 +227,19 @@ mod tests {
         set.failed_handshake(failed);
         assert_eq!(set.sample_for_handshake(), None);
         assert_eq!(set.sample_for_run(), Some(good));
+    }
+
+    #[test]
+    fn rejected_addresses_are_never_sampled() {
+        let set = AddressSet::default();
+        let peer = addr("1.2.3.4:8333");
+        set.add_gossiped(vec![peer]);
+        set.rejected(peer);
+        set.add_gossiped(vec![peer]);
+        assert!(status(&set, peer).starts_with("Some(Rejected"));
+        assert_eq!(set.sample_for_handshake(), None);
+        assert_eq!(set.sample_for_run(), None);
+        assert!(set.sample_successful().is_empty());
     }
 
     #[test]
