@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use rand::{
@@ -18,6 +18,9 @@ const RERUN_COOLDOWN: Duration = Duration::from_secs(60 * 60 * 24);
 const RERUN_WEIGHT: f64 = 0.001;
 const DNS_SAMPLE_SIZE: usize = 10;
 const DEFAULT_PORT: u16 = 8333;
+const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(60 * 15);
+
+type WeightedIp = (IpAddr, f64);
 
 #[derive(Debug)]
 pub enum PeerStatus {
@@ -104,29 +107,23 @@ impl AddressSet {
         })
     }
 
-    pub fn sample_successful(&self) -> Vec<IpAddr> {
+    pub fn snapshot(&self) -> Snapshot {
         let lock = self.addrs.lock().unwrap();
-        let mut rng = rand::rng();
-        let mut keyed: Vec<(f64, SocketAddr)> = lock
+        let (v4, v6): (Vec<WeightedIp>, Vec<WeightedIp>) = lock
             .iter()
             .filter_map(|(addr, status)| match status {
                 PeerStatus::SuccessfulRun(stats) if addr.port() == DEFAULT_PORT => {
                     let weight = 1.0 / stats.time_elapsed.as_secs_f64().max(f64::EPSILON);
-                    let key = rng.random::<f64>().powf(1.0 / weight);
-                    Some((key, *addr))
+                    Some((addr.ip(), weight))
                 }
                 _ => None,
             })
-            .collect();
-        keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        let (v4, v6): (Vec<IpAddr>, Vec<IpAddr>) = keyed
-            .into_iter()
-            .map(|(_, addr)| addr.ip())
-            .partition(IpAddr::is_ipv4);
-        v4.into_iter()
-            .take(DNS_SAMPLE_SIZE)
-            .chain(v6.into_iter().take(DNS_SAMPLE_SIZE))
-            .collect()
+            .partition(|(ip, _)| ip.is_ipv4());
+        Snapshot {
+            v4,
+            v6,
+            taken: Instant::now(),
+        }
     }
 
     fn sample_by_weight(
@@ -143,6 +140,39 @@ impl AddressSet {
         let idx = dist.sample(&mut rand::rng());
         Some(addrs[idx])
     }
+}
+
+#[derive(Debug)]
+pub struct Snapshot {
+    v4: Vec<WeightedIp>,
+    v6: Vec<WeightedIp>,
+    taken: Instant,
+}
+
+impl Snapshot {
+    pub fn is_stale(&self) -> bool {
+        self.taken.elapsed() > SNAPSHOT_MAX_AGE
+    }
+
+    pub fn sample(&self) -> Vec<IpAddr> {
+        let mut rng = rand::rng();
+        let mut v4 = weighted_shuffle(&self.v4, &mut rng);
+        v4.extend(weighted_shuffle(&self.v6, &mut rng));
+        v4
+    }
+}
+
+fn weighted_shuffle(peers: &[WeightedIp], rng: &mut impl rand::Rng) -> Vec<IpAddr> {
+    let mut keyed: Vec<(f64, IpAddr)> = peers
+        .iter()
+        .map(|(ip, weight)| (rng.random::<f64>().powf(1.0 / weight), *ip))
+        .collect();
+    keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    keyed
+        .into_iter()
+        .take(DNS_SAMPLE_SIZE)
+        .map(|(_, ip)| ip)
+        .collect()
 }
 
 fn age_secs(now: SystemTime, then: SystemTime) -> f64 {
@@ -191,7 +221,7 @@ mod tests {
         let set = AddressSet::default();
         assert_eq!(set.sample_for_handshake(), None);
         assert_eq!(set.sample_for_run(), None);
-        assert!(set.sample_successful().is_empty());
+        assert!(set.snapshot().sample().is_empty());
     }
 
     #[test]
@@ -212,7 +242,7 @@ mod tests {
         set.add_gossiped(vec![peer]);
         assert_eq!(set.sample_for_handshake(), Some(peer));
         assert_eq!(set.sample_for_run(), None);
-        assert!(set.sample_successful().is_empty());
+        assert!(set.snapshot().sample().is_empty());
     }
 
     #[test]
@@ -239,7 +269,7 @@ mod tests {
         assert!(status(&set, peer).starts_with("Some(Rejected"));
         assert_eq!(set.sample_for_handshake(), None);
         assert_eq!(set.sample_for_run(), None);
-        assert!(set.sample_successful().is_empty());
+        assert!(set.snapshot().sample().is_empty());
     }
 
     #[test]
@@ -286,9 +316,9 @@ mod tests {
         let set = AddressSet::default();
         let peer = addr("1.2.3.4:8333");
         set.successful_run(peer, run_at(SystemTime::now()));
-        assert_eq!(set.sample_successful(), vec![peer.ip()]);
+        assert_eq!(set.snapshot().sample(), vec![peer.ip()]);
         set.failed_run(peer);
-        assert!(set.sample_successful().is_empty());
+        assert!(set.snapshot().sample().is_empty());
     }
 
     #[test]
@@ -300,7 +330,7 @@ mod tests {
         set.unsupported(addr("4.4.4.4:8333"));
         set.failed_handshake(addr("5.5.5.5:8333"));
         set.successful_run(good, run_at(SystemTime::now()));
-        assert_eq!(set.sample_successful(), vec![good.ip()]);
+        assert_eq!(set.snapshot().sample(), vec![good.ip()]);
     }
 
     #[test]
@@ -309,7 +339,7 @@ mod tests {
         for i in 0..(DNS_SAMPLE_SIZE as u8 * 2) {
             set.successful_run(addr(&format!("1.2.3.{i}:8333")), run_at(SystemTime::now()));
         }
-        let sample = set.sample_successful();
+        let sample = set.snapshot().sample();
         assert_eq!(sample.len(), DNS_SAMPLE_SIZE);
         let mut unique = sample.clone();
         unique.sort();
@@ -326,7 +356,7 @@ mod tests {
         set.successful_run(addr("[2001:db8::1]:8333"), run_at(SystemTime::now()));
         set.successful_run(addr("[2001:db8::2]:8333"), run_at(SystemTime::now()));
         for _ in 0..20 {
-            let sample = set.sample_successful();
+            let sample = set.snapshot().sample();
             assert_eq!(
                 sample.iter().filter(|ip| ip.is_ipv4()).count(),
                 DNS_SAMPLE_SIZE
@@ -344,7 +374,7 @@ mod tests {
             when: SystemTime::now(),
         };
         set.successful_run(peer, stats);
-        assert_eq!(set.sample_successful(), vec![peer.ip()]);
+        assert_eq!(set.snapshot().sample(), vec![peer.ip()]);
     }
 
     #[test]
@@ -355,7 +385,7 @@ mod tests {
         set.successful_run(addr("5.6.7.8:18333"), run_at(SystemTime::now()));
         set.successful_run(addr("1.2.3.4:9999"), run_at(SystemTime::now()));
         for _ in 0..20 {
-            assert_eq!(set.sample_successful(), vec![default.ip()]);
+            assert_eq!(set.snapshot().sample(), vec![default.ip()]);
         }
     }
 
@@ -371,11 +401,23 @@ mod tests {
         set.successful_run(fast, stats(1));
         set.successful_run(slow, stats(100));
         let fast_first = (0..1_000)
-            .filter(|_| set.sample_successful()[0] == fast.ip())
+            .filter(|_| set.snapshot().sample()[0] == fast.ip())
             .count();
         assert!(
             fast_first > 900,
             "fast peer ranked first {fast_first} times"
         );
+    }
+
+    #[test]
+    fn snapshot_is_isolated_from_later_updates() {
+        let set = AddressSet::default();
+        let peer = addr("1.2.3.4:8333");
+        set.successful_run(peer, run_at(SystemTime::now()));
+        let snapshot = set.snapshot();
+        set.failed_run(peer);
+        set.successful_run(addr("5.6.7.8:8333"), run_at(SystemTime::now()));
+        assert_eq!(snapshot.sample(), vec![peer.ip()]);
+        assert!(!snapshot.is_stale());
     }
 }

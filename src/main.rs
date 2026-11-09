@@ -46,9 +46,9 @@ fn main() -> std::io::Result<()> {
         let set = set.clone();
         std::thread::spawn(move || continuously_handshake(id, &set));
     }
-    let set = set.clone();
-    let snapshot = set.clone();
-    std::thread::spawn(move || continually_update_runs(&set));
+    let mut snapshot = set.snapshot();
+    let set_for_runs = set.clone();
+    std::thread::spawn(move || continually_update_runs(&set_for_runs));
     let socket = UdpSocket::bind(format!("0.0.0.0:{}", config.port))?;
     tracing::info!("Listening on 0.0.0.0:{} for DNS queries", config.port);
     let mut buf = [0u8; 512];
@@ -60,7 +60,10 @@ fn main() -> std::io::Result<()> {
                 continue;
             }
         };
-        let sample = snapshot.sample_successful();
+        if snapshot.is_stale() {
+            snapshot = set.snapshot();
+        }
+        let sample = snapshot.sample();
         let query = &buf[..len];
         let response_buf = match dns::build_reponse(query, &dns_conf, &sample) {
             Ok(buf) => buf,
