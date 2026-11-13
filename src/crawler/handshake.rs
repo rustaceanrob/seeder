@@ -5,6 +5,7 @@ use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::{message_network::VersionMessage, ServiceFlags};
 
 const REJECTED_USER_AGENTS: [&str; 2] = ["Knots", "UASF"];
+const MAX_ADDRS: usize = 1_000;
 
 #[derive(Debug)]
 pub struct RejectedUserAgent(String);
@@ -64,7 +65,7 @@ impl Handshake<Uninitialized> {
     pub fn new() -> Handshake<Uninitialized> {
         Self {
             version: None,
-            addrs: Vec::with_capacity(1_000),
+            addrs: Vec::with_capacity(MAX_ADDRS),
             _marker: PhantomData,
         }
     }
@@ -127,7 +128,8 @@ impl Handshake<VerackReceived> {
                 self.addrs.extend(
                     entries
                         .into_iter()
-                        .filter_map(|entry| entry.socket_addr().ok()),
+                        .filter_map(|entry| entry.socket_addr().ok())
+                        .take(MAX_ADDRS),
                 );
                 Ok(ProcessAddresses::Completed((
                     self.version.unwrap().services,
@@ -320,6 +322,21 @@ mod tests {
                     ]
                 );
             }
+            _ => panic!("addrv2 must complete the handshake"),
+        }
+    }
+
+    #[test]
+    fn addrv2_entries_are_truncated() {
+        let handshake = negotiated(ServiceFlags::NETWORK);
+        let entries = (0..(MAX_ADDRS as u32 * 2))
+            .map(|i| addr_v2(AddrV2::Ipv4(i.into()), 8333))
+            .collect();
+        match handshake
+            .process_message(NetworkMessage::AddrV2(entries))
+            .unwrap()
+        {
+            ProcessAddresses::Completed((_, addrs)) => assert_eq!(addrs.len(), MAX_ADDRS),
             _ => panic!("addrv2 must complete the handshake"),
         }
     }

@@ -25,6 +25,8 @@ pub fn continually_update_runs(addresses: &AddressSet) {
         .build()
         .expect("tokio runtime required");
     loop {
+        let pruned = addresses.prune();
+        tracing::info!("Pruned {pruned} repeatedly failing addresses");
         let random = addresses.sample_for_run();
         match random {
             Some(socket_addr) => match download_filter_range(&rt, socket_addr) {

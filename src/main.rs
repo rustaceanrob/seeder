@@ -40,7 +40,7 @@ fn main() -> std::io::Result<()> {
         .open(config.seed_node, Timeouts::default())
         .expect("Seed connection failed!");
     tracing::info!("Seeded with {} network addresses", addrs.len());
-    let set = AddressSet::default();
+    let set = AddressSet::with_max_capacity();
     set.add_gossiped(addrs);
     for id in 0..7 {
         let set = set.clone();

@@ -19,6 +19,9 @@ const RERUN_WEIGHT: f64 = 0.001;
 const DNS_SAMPLE_SIZE: usize = 10;
 const DEFAULT_PORT: u16 = 8333;
 const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(60 * 15);
+const MAX_ADDRESSES: usize = 3_500_000;
+const EVICT_TO: usize = 3_000_000;
+const MAX_FAILED_ATTEMPTS: u8 = 7;
 
 type WeightedIp = (IpAddr, f64);
 
@@ -38,12 +41,39 @@ pub struct AddressSet {
 }
 
 impl AddressSet {
+    pub fn with_max_capacity() -> Self {
+        Self {
+            addrs: Arc::new(Mutex::new(HashMap::with_capacity(MAX_ADDRESSES))),
+        }
+    }
+
     pub fn add_gossiped(&self, addrs: Vec<SocketAddr>) {
+        self.add_gossiped_bounded(addrs, MAX_ADDRESSES, EVICT_TO);
+    }
+
+    fn add_gossiped_bounded(&self, addrs: Vec<SocketAddr>, max: usize, evict_to: usize) {
         let mut lock = self.addrs.lock().unwrap();
         for addr in addrs {
+            if lock.len() >= max && !lock.contains_key(&addr) {
+                let evicted = evict(&mut lock, evict_to);
+                tracing::info!("Evicted {evicted} addresses, {} remain", lock.len());
+                if lock.len() >= max {
+                    tracing::warn!("Address set is full, dropping gossiped addresses");
+                    return;
+                }
+            }
             lock.entry(addr)
                 .or_insert(PeerStatus::Gossiped(SystemTime::now()));
         }
+    }
+
+    pub fn prune(&self) -> usize {
+        let mut lock = self.addrs.lock().unwrap();
+        let before = lock.len();
+        lock.retain(|_, status| {
+            !matches!(status, PeerStatus::Failed((_, attempts)) if *attempts >= MAX_FAILED_ATTEMPTS)
+        });
+        before - lock.len()
     }
 
     pub fn successful_run(&self, addr: SocketAddr, stats: RunStats) {
@@ -173,6 +203,40 @@ fn weighted_shuffle(peers: &[WeightedIp], rng: &mut impl rand::Rng) -> Vec<IpAdd
         .take(DNS_SAMPLE_SIZE)
         .map(|(_, ip)| ip)
         .collect()
+}
+
+fn evict(addrs: &mut HashMap<SocketAddr, PeerStatus>, target: usize) -> usize {
+    let excess = addrs.len().saturating_sub(target);
+    if excess == 0 {
+        return 0;
+    }
+    let mut rng = rand::rng();
+    let mut candidates: Vec<((u8, u8, u64), SocketAddr)> = addrs
+        .iter()
+        .filter_map(|(addr, status)| {
+            let rank = match status {
+                PeerStatus::Failed((then, attempts)) => {
+                    let secs = then
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    (0, u8::MAX - attempts, secs)
+                }
+                PeerStatus::Rejected | PeerStatus::NoFilters => (1, 0, 0),
+                PeerStatus::Gossiped(_) => (2, 0, rng.random::<u64>()),
+                PeerStatus::ShouldMeasure(_) | PeerStatus::SuccessfulRun(_) => return None,
+            };
+            Some((rank, *addr))
+        })
+        .collect();
+    if candidates.len() > excess {
+        candidates.select_nth_unstable_by_key(excess, |(rank, _)| *rank);
+        candidates.truncate(excess);
+    }
+    for (_, addr) in &candidates {
+        addrs.remove(addr);
+    }
+    candidates.len()
 }
 
 fn age_secs(now: SystemTime, then: SystemTime) -> f64 {
@@ -407,6 +471,100 @@ mod tests {
             fast_first > 900,
             "fast peer ranked first {fast_first} times"
         );
+    }
+
+    #[test]
+    fn gossip_evicts_when_full() {
+        let set = AddressSet::default();
+        let failed = addr("1.1.1.1:8333");
+        let rejected = addr("2.2.2.2:8333");
+        let measuring = addr("3.3.3.3:8333");
+        let good = addr("4.4.4.4:8333");
+        set.failed_handshake(failed);
+        set.rejected(rejected);
+        set.successful_handshake(measuring);
+        set.successful_run(good, run_at(SystemTime::now()));
+        let new = addr("5.5.5.5:8333");
+        set.add_gossiped_bounded(vec![new], 4, 3);
+        let lock = set.addrs.lock().unwrap();
+        assert_eq!(lock.len(), 4);
+        assert!(!lock.contains_key(&failed));
+        assert!(lock.contains_key(&rejected));
+        assert!(lock.contains_key(&new));
+    }
+
+    #[test]
+    fn eviction_prefers_most_failed_then_oldest() {
+        let set = AddressSet::default();
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(100);
+        let many = addr("1.1.1.1:8333");
+        let few_old = addr("2.2.2.2:8333");
+        let few_new = addr("3.3.3.3:8333");
+        {
+            let mut lock = set.addrs.lock().unwrap();
+            lock.insert(many, PeerStatus::Failed((now, 5)));
+            lock.insert(few_old, PeerStatus::Failed((old, 1)));
+            lock.insert(few_new, PeerStatus::Failed((now, 1)));
+        }
+        let mut lock = set.addrs.lock().unwrap();
+        assert_eq!(evict(&mut lock, 2), 1);
+        assert!(!lock.contains_key(&many));
+        assert_eq!(evict(&mut lock, 1), 1);
+        assert!(!lock.contains_key(&few_old));
+        assert!(lock.contains_key(&few_new));
+    }
+
+    #[test]
+    fn eviction_falls_back_to_gossiped() {
+        let set = AddressSet::default();
+        let gossiped: Vec<SocketAddr> = (0..10).map(|i| addr(&format!("1.2.3.{i}:8333"))).collect();
+        set.add_gossiped(gossiped);
+        set.unsupported(addr("1.2.3.0:8333"));
+        let mut lock = set.addrs.lock().unwrap();
+        assert_eq!(evict(&mut lock, 5), 5);
+        assert_eq!(lock.len(), 5);
+        assert!(!lock.contains_key(&addr("1.2.3.0:8333")));
+    }
+
+    #[test]
+    fn full_set_of_protected_addresses_drops_gossip() {
+        let set = AddressSet::default();
+        set.successful_handshake(addr("1.1.1.1:8333"));
+        set.successful_run(addr("2.2.2.2:8333"), run_at(SystemTime::now()));
+        set.add_gossiped_bounded(vec![addr("3.3.3.3:8333")], 2, 1);
+        assert_eq!(set.addrs.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn known_addresses_are_not_blocked_when_full() {
+        let set = AddressSet::default();
+        let peer = addr("1.1.1.1:8333");
+        set.successful_handshake(peer);
+        set.add_gossiped_bounded(vec![peer], 1, 0);
+        assert!(status(&set, peer).starts_with("Some(ShouldMeasure"));
+    }
+
+    #[test]
+    fn prune_removes_repeatedly_failed_addresses() {
+        let set = AddressSet::default();
+        let dead = addr("1.1.1.1:8333");
+        let flaky = addr("2.2.2.2:8333");
+        let gossiped = addr("3.3.3.3:8333");
+        {
+            let mut lock = set.addrs.lock().unwrap();
+            lock.insert(
+                dead,
+                PeerStatus::Failed((SystemTime::now(), MAX_FAILED_ATTEMPTS)),
+            );
+            lock.insert(flaky, PeerStatus::Failed((SystemTime::now(), 1)));
+        }
+        set.add_gossiped(vec![gossiped]);
+        assert_eq!(set.prune(), 1);
+        let lock = set.addrs.lock().unwrap();
+        assert!(!lock.contains_key(&dead));
+        assert!(lock.contains_key(&flaky));
+        assert!(lock.contains_key(&gossiped));
     }
 
     #[test]
