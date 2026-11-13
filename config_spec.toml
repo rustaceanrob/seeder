@@ -38,6 +38,13 @@ default = "10"
 doc = "Maximum number of responses."
 
 [[param]]
+name = "crawler_threads"
+type = "u16"
+optional = true
+default = "6"
+doc = "Number of threads handshaking with peers."
+
+[[param]]
 name = "seed_node"
 type = "std::net::SocketAddr"
 optional = false
