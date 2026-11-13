@@ -90,12 +90,13 @@ or kresd alongside the seeder on port 53 fails the build with an error.
 
 Optional module settings and their defaults:
 
-| Option         | Default | Meaning                                  |
-| -------------- | ------- | ---------------------------------------- |
-| `port`         | `53`    | UDP port to listen on                    |
-| `ttl`          | `60`    | TTL of returned records                  |
-| `answers`      | `10`    | Maximum addresses per response           |
-| `openFirewall` | `true`  | Open `port` over UDP in the NixOS firewall |
+| Option           | Default | Meaning                                    |
+| ---------------- | ------- | ------------------------------------------ |
+| `port`           | `53`    | UDP port to listen on                      |
+| `ttl`            | `60`    | TTL of returned records                    |
+| `answers`        | `10`    | Maximum addresses per response             |
+| `crawlerThreads` | `6`     | Threads handshaking with peers             |
+| `openFirewall`   | `true`  | Open `port` over UDP in the NixOS firewall |
 
 `disk.nix` describes the disk layout. Check the device name on the VPS with `lsblk` (commonly
 `/dev/sda` or `/dev/vda`):

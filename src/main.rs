@@ -42,7 +42,7 @@ fn main() -> std::io::Result<()> {
     tracing::info!("Seeded with {} network addresses", addrs.len());
     let set = AddressSet::with_max_capacity();
     set.add_gossiped(addrs);
-    for id in 0..7 {
+    for id in 0..config.crawler_threads as usize {
         let set = set.clone();
         std::thread::spawn(move || continuously_handshake(id, &set));
     }

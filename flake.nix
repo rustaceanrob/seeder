@@ -93,6 +93,12 @@
               description = "Maximum number of records per response.";
             };
 
+            crawlerThreads = lib.mkOption {
+              type = lib.types.ints.u16;
+              default = 6;
+              description = "Number of threads handshaking with peers.";
+            };
+
             openFirewall = lib.mkOption {
               type = lib.types.bool;
               default = true;
@@ -147,6 +153,8 @@
                   (toString cfg.ttl)
                   "--answers"
                   (toString cfg.answers)
+                  "--crawler-threads"
+                  (toString cfg.crawlerThreads)
                   "--seed-node"
                   cfg.seedNode
                 ];
