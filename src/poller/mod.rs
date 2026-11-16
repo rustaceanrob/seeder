@@ -3,8 +3,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use bip157::{tokio, BlockHash, Builder, Client, Event, HashCheckpoint, Info, Receiver, Warning};
-use bitcoin::Network;
+use bip157::{
+    tokio, BlockHash, Builder, Client, Event, HashCheckpoint, Info, Receiver, TrustedPeer, Warning,
+};
+use bitcoin::{p2p::ServiceFlags, Network};
 
 use crate::ranking::AddressSet;
 
@@ -75,8 +77,10 @@ async fn build_and_download(
     from: HashCheckpoint,
     to: BlockHash,
 ) -> Result<RunStats, std::io::Error> {
+    let mut peer = TrustedPeer::from_socket_addr(addr);
+    peer.set_services(ServiceFlags::P2P_V2);
     let (node, client) = Builder::new(Network::Bitcoin)
-        .add_peer(addr)
+        .add_peer(peer)
         .chain_state(bip157::ChainState::Checkpoint(from))
         .required_peers(1)
         .whitelist_only()
@@ -96,11 +100,7 @@ async fn build_and_download(
     });
     loop {
         match event_rx.recv().await {
-            Some(Event::IndexedFilter(filter)) => {
-                if filter.block_hash() == to {
-                    break;
-                }
-            }
+            Some(Event::IndexedFilter(filter)) if filter.block_hash() == to => break,
             None => return Err(std::io::Error::other("Unexpected end of sync")),
             _ => (),
         }

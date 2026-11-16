@@ -6,6 +6,7 @@ use std::{
 const MAX_NAME_LEN: usize = 255;
 // The question always begins directly after the 12 byte header.
 const QUESTION_NAME_OFFSET: u16 = 12;
+const SERVED_SERVICES: u64 = 0x849;
 
 pub struct Configuration<'a> {
     // e.g. seed.example.com
@@ -284,15 +285,18 @@ pub fn build_reponse(
     if qclass != QClass::IN {
         return Err(invalid_data("Invalid QClass"));
     }
-    if is_subdomain(&name, config.hostname) {
-        let err = ResponseCode::NO_DOMAIN;
-        let flags = Flags::new(recurse_bit, err);
-        return Ok(AnswerSection::empty(id, flags, question));
-    }
-    if !name.eq_ignore_ascii_case(config.hostname) {
-        let flags = Flags::refused(recurse_bit);
-        return Ok(AnswerSection::empty(id, flags, question));
-    }
+    let is_apex = match zone_name(&name, config.hostname) {
+        ZoneName::Apex => true,
+        ZoneName::ServiceFilter => false,
+        ZoneName::NoDomain => {
+            let flags = Flags::new(recurse_bit, ResponseCode::NO_DOMAIN);
+            return Ok(AnswerSection::empty(id, flags, question));
+        }
+        ZoneName::Outside => {
+            let flags = Flags::refused(recurse_bit);
+            return Ok(AnswerSection::empty(id, flags, question));
+        }
+    };
     if qtype == QType::A {
         let ip_iter = sample.iter().filter(|f| f.is_ipv4());
         let rsp = ResponseCode::NO_ERROR;
@@ -311,12 +315,12 @@ pub fn build_reponse(
                 .finish(question),
         );
     }
-    if qtype == QType::SOA {
+    if is_apex && qtype == QType::SOA {
         let rsp = ResponseCode::NO_ERROR;
         let flags = Flags::new(recurse_bit, rsp);
         return Ok(AnswerSection::soa_response(id, flags, config).finish(question));
     }
-    if qtype == QType::NS {
+    if is_apex && qtype == QType::NS {
         let rsp = ResponseCode::NO_ERROR;
         let flags = Flags::new(recurse_bit, rsp);
         return Ok(AnswerSection::ns_response(id, flags, config).finish(question));
@@ -327,12 +331,43 @@ pub fn build_reponse(
     Ok(AnswerSection::empty(id, flags, question))
 }
 
-/// Whether `name` sits strictly below `zone`, ignoring ASCII case.
-fn is_subdomain(name: &str, zone: &str) -> bool {
-    let (name, zone) = (name.as_bytes(), zone.as_bytes());
-    name.len() > zone.len() + 1
-        && name[name.len() - zone.len() - 1] == b'.'
-        && name[name.len() - zone.len()..].eq_ignore_ascii_case(zone)
+enum ZoneName {
+    Apex,
+    ServiceFilter,
+    NoDomain,
+    Outside,
+}
+
+fn zone_name(name: &str, zone: &str) -> ZoneName {
+    if name.eq_ignore_ascii_case(zone) {
+        return ZoneName::Apex;
+    }
+    let Some(label) = subdomain_label(name, zone) else {
+        return ZoneName::Outside;
+    };
+    match parse_service_filter(label) {
+        Some(services) if services & !SERVED_SERVICES == 0 => ZoneName::ServiceFilter,
+        _ => ZoneName::NoDomain,
+    }
+}
+
+/// The labels of `name` strictly below `zone`, ignoring ASCII case.
+fn subdomain_label<'a>(name: &'a str, zone: &str) -> Option<&'a str> {
+    let (bytes, zone) = (name.as_bytes(), zone.as_bytes());
+    let is_subdomain = bytes.len() > zone.len() + 1
+        && bytes[bytes.len() - zone.len() - 1] == b'.'
+        && bytes[bytes.len() - zone.len()..].eq_ignore_ascii_case(zone);
+    is_subdomain.then(|| &name[..name.len() - zone.len() - 1])
+}
+
+fn parse_service_filter(label: &str) -> Option<u64> {
+    let hex = label
+        .strip_prefix('x')
+        .or_else(|| label.strip_prefix('X'))?;
+    if hex.is_empty() || hex.len() > 16 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
 }
 
 fn invalid_data(msg: &'static str) -> std::io::Error {
@@ -718,6 +753,55 @@ mod tests {
             let response = build_reponse(&query, &test_config(), &sample()).unwrap();
             assert_eq!(&response[6..8], &0u16.to_be_bytes(), "{name}");
             assert_eq!(&response[12..], &query[12..], "{name}");
+        }
+    }
+
+    #[test]
+    fn answers_supported_service_filters() {
+        for name in [
+            "x849.seed.example.com",
+            "X849.SEED.example.com",
+            "x9.seed.example.com",
+            "x49.seed.example.com",
+            "x0000000000000849.seed.example.com",
+        ] {
+            let query = query(0x01, name, QType::A);
+            let response = build_reponse(&query, &test_config(), &sample()).unwrap();
+            assert_eq!(rcode_and_aa(&response), (0, true), "{name}");
+            let (mut reader, ancount) = answers(&response, query.len());
+            assert_eq!(ancount, 1, "{name}");
+            let (record_name, _, _, _, rdata) = read_record(&mut reader);
+            assert_eq!(record_name, name);
+            assert_eq!(rdata, vec![1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_service_filters() {
+        for name in [
+            "x.seed.example.com",
+            "x1849.seed.example.com",
+            "x400.seed.example.com",
+            "x+849.seed.example.com",
+            "x84g.seed.example.com",
+            "x00000000000000849.seed.example.com",
+            "849.seed.example.com",
+            "a.x849.seed.example.com",
+        ] {
+            let query = query(0x01, name, QType::A);
+            let response = build_reponse(&query, &test_config(), &sample()).unwrap();
+            assert_eq!(rcode_and_aa(&response), (3, true), "{name}");
+            assert_eq!(&response[6..8], &0u16.to_be_bytes(), "{name}");
+        }
+    }
+
+    #[test]
+    fn service_filter_has_no_apex_records() {
+        for qtype in [QType::SOA, QType::NS] {
+            let query = query(0x01, "x849.seed.example.com", qtype);
+            let response = build_reponse(&query, &test_config(), &sample()).unwrap();
+            assert_eq!(rcode_and_aa(&response), (0, true));
+            assert_eq!(&response[6..8], &0u16.to_be_bytes());
         }
     }
 
